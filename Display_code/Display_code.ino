@@ -21,14 +21,14 @@ const long  gmtOffset_sec = -18000;
 const int   daylightOffset_sec = 0;//GMT+5:30
 
 //NEXTION DISPLAY OBJECTS
-NexPage page0    = NexPage(0, 0, "page0");
+NexPage page1    = NexPage(1, 0, "page1");
 
 void setup(){
   nexInit();
   dbSerial.begin(9600);
   Serial.begin(115200);
   delay(500);
-  page0.show();
+  page1.show();
 
 
   syncTimeFromWiFi();
