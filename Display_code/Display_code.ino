@@ -20,8 +20,16 @@ const char* ntpServer = "jm.pool.ntp.org";
 const long  gmtOffset_sec = -18000;
 const int   daylightOffset_sec = 0;//GMT+5:30
 
+//NEXTION DISPLAY OBJECTS
+NexPage page0    = NexPage(0, 0, "page0");
+
 void setup(){
+  nexInit();
+  dbSerial.begin(9600);
   Serial.begin(115200);
+  delay(500);
+  page0.show();
+
 
   syncTimeFromWiFi();
 }
