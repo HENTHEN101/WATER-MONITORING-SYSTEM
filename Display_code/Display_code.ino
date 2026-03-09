@@ -3,6 +3,10 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <Nextion.h>
+#include <Preferences.h>
+#include <stdarg.h>
+
+Preferences prefs;
 
 //DEFINED VARIBALES
 //lora pins
@@ -26,33 +30,59 @@
 #define RX_QUEUE_SIZE 6
 #define MAX_PACKET_SIZE 21
 #define RX_NEXT(i) ((uint8_t)((i + 1) % RX_QUEUE_SIZE))
+//Popup queue implementation
+#define POPUP_QUEUE_SIZE 8
+#define POPUP_TEXT_LEN 200
+
+// #define BATTERY_PIN 34
+// const float R1 = 100000.0;
+// const float R2 = 33000.0;
+// const float ADC_REF = 3.3;
+// float alpha = 0.1;   // 0.05 = very smooth, 0.2 = faster response
+
+// Backup values (for rollback if remote calibration fails)
+float backup_TANKHEIGHT = 0;
+//CalibrationSettings backup_tnkset = {0};
+bool backup_full_pressed = false;
+bool backup_empty_pressed = false;
+bool backup_tnkcalibrated = false;
+//bool calPending = false;        // true while waiting for ACK for CAL_SETTINGS
+
 
 //DATA FLAGS
 volatile bool loraPacketReady = false;
 bool tankConnected = false;
 bool pumpConnected = false;
 bool pump_triggered = false;
-bool g_popupActive = false;
-bool g_popupPendingUpdate = false;
+//bool g_popupActive = false;
+//bool g_popupPendingUpdate = false;
 bool waitingTankUpdate = false;
 bool waitingPumpUpdate = false;
 bool tnkcalibrated = false;
 bool Pmp_manual_override = false;
+bool emptying_fulling = false;
+bool full_pressed = false;
+bool empty_pressed = false;
+bool timedateset = false;
+bool loraactive = false;
+bool wifiactive = false;
+bool blynkactive = false;
 
 //TIMER VALUES
 unsigned long lastRetryTime =0;
 unsigned long lastTimeupdate =0;
-const unsigned long timeinterval =1000;
-const unsigned long HEARTBEAT_INTERVAL = 30000;
+//const unsigned long timeinterval =60000;
+const unsigned long HEARTBEAT_INTERVAL = 20000;
 unsigned long lastheartbeat =0;
 unsigned long acktimer =0; 
+unsigned long nextClockUpdate = 0;
 const unsigned long ACK_TIMEOUT = 5000; 
 const unsigned long DATA_TIMEOUT = 30000;
 unsigned long getupdate = 0;
-
+struct tm currentTime;
 //WIFI CREDENTIALS
-const char* ssid     = "Shane's A15";
-const char* password = "Meforever123";
+char ssid[32]="MonaConnect";
+char password[63]="";
 
 //DATE AND TIME SETTERS
 const char* ntpServer = "jm.pool.ntp.org";
@@ -72,6 +102,8 @@ uint8_t g_pumpMode    = 0;   // 0 = MANUAL, 1 = AUTO
 uint8_t g_pumpState   = 0;   // 0 = OFF, 1 = ON
 uint8_t prev_g_pumpMode    = 0;   // 0 = MANUAL, 1 = AUTO
 uint8_t prev_g_pumpState   = 0;   // 0 = OFF, 1 = ON
+uint8_t g_blynkstste = 0; //0=OFF, 1=ON
+uint8_t prev_g_blynkstste =0; // 0 = OFF, 1 = ON
 uint8_t currpg = 0;//current page
 uint8_t prevcurrpg = 0;//current page
 char g_popupHead[20] = {0};
@@ -91,10 +123,15 @@ byte msgcount = 0;
 //NEXTION DISPLAY OBJECTS
 //page0 home
 NexPage page0 = NexPage(0, 0, "page0");//**
+NexPicture cloudicon =  NexPicture(0,7,"pcloud");
+NexPicture radioicon =  NexPicture(0,8,"pradio");
+NexPicture wifiicon =  NexPicture(0,9,"pwifi");
+NexButton settingbtn = NexButton(0,2,"set");//**
 NexButton tankbtn = NexButton(0,3,"tank");//**
 NexButton pumpbtn = NexButton(0,4,"pump");//**
 NexText Time = NexText(0,5,"time");//**
 NexText Date = NexText(0,6,"date");//**
+
 //NexVariable currentpage = NexVariable(0,7,"currpage");
 
 //page1 tank
@@ -122,33 +159,53 @@ NexText pstarttxt = NexText(2,8,"pstart");//shows pump start time**
 NexText pstptxt = NexText(2,9,"pstop");//shows pump stop time**
 NexText pnametxt = NexText(2,2,"pname");//user input
 
-//page3 tank calibration 
-NexPage page3 = NexPage(3,0,"page3");//**
-NexText theight = NexText(3,12,"tnkheight");
-//NexDSButton tfullbtn = NexDSButton(3,7,"full");//user input to calibrate tank
-//NexDSButton temptybtn = NexDSButton(3,8,"empty");//user input to calibrate tank 
-NexButton tconfirm = NexButton(3,5,"tcon");//confirms and set tank size**
-NexButton tcancel = NexButton(3,4,"tcan");//leave calibration seeting no variable update**
-NexNumber tapprox = NexNumber(3,9,"approx");//user input via sub and plus button**
-NexVariable fulemp = NexVariable(3,13,"fulemp");//**
+//page3 setting
+NexPage page3 = NexPage(3,0,"page3");
+NexButton sbackbtn = NexButton(3,9,"sback");
+NexDSButton blynkbtn = NexDSButton(3,3,"blynk");
+NexButton chngwifi = NexButton(3,8,"chngwifi");
+//NexButton tdchng = NexButton(3,5,"tdchange");
+NexText wifiname = NexText(3,10,"wifiname");
 
-//page4 pump start and stop time
+//page4 tank calibration 
 NexPage page4 = NexPage(4,0,"page4");//**
+NexText theight = NexText(4,12,"tnkheight");
+NexDSButton tfullbtn = NexDSButton(4,7,"full");//user input to calibrate tank
+NexDSButton temptybtn = NexDSButton(4,8,"empty");//user input to calibrate tank
+//NexButton restcal = NexButton(3,13,"restcal");
+NexButton tconfirm = NexButton(4,5,"tcon");//confirms and set tank size**
+NexButton tcancel = NexButton(4,4,"tcan");//leave calibration seeting no variable update**
+NexNumber tapprox = NexNumber(4,9,"approx");//user input via sub and plus button**
+NexVariable fulemp = NexVariable(4,13,"fulemp");//**
+
+//page5 pump start and stop time
+NexPage page5 = NexPage(5,0,"page5");//**
 //NexButton hradd = NexButton(4,5,"hadd");//used to add hour
 //NexButton minadd = NexButton(4,6,"madd");//used to add min
 //NexButton hrsub = NexButton(4,10,"hsub");//used to sub hour
 //NexButton minsub = NexButton(4,11,"msub");//used to sub min
-NexButton pconfirm = NexButton(4,11,"pcon");//confirm and set time**
-NexButton pcancel = NexButton(4,12,"pcan");//leave time settings, no variable update**
-NexNumber hrnum = NexNumber(4,8,"hnum");// used to show hour**
-NexNumber minnum = NexNumber(4,7,"mnum");//used to show min**
+NexButton pconfirm = NexButton(5,11,"pcon");//confirm and set time**
+NexButton pcancel = NexButton(5,12,"pcan");//leave time settings, no variable update**
+NexNumber hrnum = NexNumber(5,8,"hnum");// used to show hour**
+NexNumber minnum = NexNumber(5,7,"mnum");//used to show min**
 
-//page5 popup page
-NexPage page5 = NexPage(5,0,"page5");//
-NexText pophead = NexText(5,1,"head");
-NexText popcontent = NexText(5,2,"content");
-NexHotspot exitpop = NexHotspot(5,4,"exitpop");
+//page6 popup page
+NexPage page6 = NexPage(6,0,"page6");//
+NexText pophead = NexText(6,1,"head");
+NexText popcontent = NexText(6,2,"content");
+NexHotspot exitpop = NexHotspot(6,3,"exitpop");
+NexText msgcounter = NexText(6,4,"msgcount");
 //NexVariable popstyle = NexVariable(5,5,"style");
+
+//page7 popup page
+NexPage page7 = NexPage(7,0,"page7");//
+
+//page8 wifi calibration
+NexPage page8 = NexPage(8,0,"page8");//
+NexText wifiID = NexText(8,8,"SSID");
+NexText wifipass = NexText(8,7,"PASS");
+NexButton wconfirm = NexButton(8,3,"wcon");
+NexButton wcancel = NexButton(8,4,"wcan");
 
 
 //SYSTEM STATE HOLDERS
@@ -177,6 +234,20 @@ typedef enum{
   TIME_NORMAL,
   TIME_RECONNECTING
 }TimeSyncState;
+//error messages formm tank
+enum Errortype{
+  NO_ERROR,
+  UNKNOWN_ERROR,
+  FAULTY_SENSOR,
+  INVALID_TNKHEIGHT,
+  INVALID_OFFSET
+};
+Errortype ERROR = NO_ERROR;
+enum TextRule {
+  RULE_SSID,
+  RULE_PASSWORD,
+  RULE_NUMBER
+};
 static TimeSyncState timeState = TIME_NORMAL;
 //connection status 
 const char* connectiontext[]={
@@ -192,7 +263,22 @@ const char* calibrationtext[] ={
   "Partial",
   "Fully"
 };
-
+// tank Error strings
+const char* TankErrorStrings[] = {
+    "No Error",
+    "System malcfunction due to unknown fault",
+    "Tank sensor not operating properly",
+    "Tank size recieved by tank invalid",
+    "Ensure system is installed over 3cm above highest water level",
+    "Tank is uncalibrated"
+};
+//pump error strings
+const char* PumpErrorStrings[]={
+  "No Error",
+  "System malcfunction due to unknown fault",
+  "Toggling pump too fast please wait 3 seconds.",
+  "Tank is in manual override"
+};
 //LORA DATA PACKET structures
 struct RxPacket {
   uint8_t data[MAX_PACKET_SIZE];
@@ -210,27 +296,27 @@ struct pendingTX{
   uint8_t payload[16]; 
   uint8_t payloadLen; 
 };
-pendingTX tx = {0};
+pendingTX tx{};
 
 //tanklvel packet 
 struct TankLevelPayload {
   uint8_t percent;
   uint8_t cal_stage; 
 };
-TankLevelPayload tnklvl;
+TankLevelPayload tnklvl{};
 
 //pumpstatus packet 
 struct PumpStatusPayload {
   uint8_t state;
   uint8_t mode;
 };
-PumpStatusPayload pmpstat;
+PumpStatusPayload pmpstat{};
 
 //tank calibrtion level packet 
-struct CalibrationPayload { 
-  uint8_t level; 
+struct ErrorPayload { 
+  uint8_t ERR; 
 };
-CalibrationPayload tnkcal;
+ErrorPayload errotype{};
 
 //tank calibration packet
 struct CalibrationSettings { 
@@ -238,15 +324,28 @@ struct CalibrationSettings {
   uint8_t value;  // % if estimated, unused otherwise 
   uint16_t tankHeightCm;  // usable water height
 };
-CalibrationSettings tnkset;
+CalibrationSettings tnkset{};
 
+struct PopupMessage {
+  uint32_t severity;           // 0..2 (for setPopupHeadFromValue)
+  char content[POPUP_TEXT_LEN];
+};
+struct PopupManager {
+  PopupMessage queue[POPUP_QUEUE_SIZE];
+  uint8_t head = 0;
+  uint8_t tail = 0;
+  uint8_t count = 0;
+  bool active = false;
+  uint8_t currentIndex = 0;
+};
+PopupManager popup;
 
 //DISPLAY UI INTERATION LISTENER
-NexTouch *nex_listen_list[]=
-{
+NexTouch *nex_listen_list[]={
   //page0
   &tankbtn,
   &pumpbtn,
+  &settingbtn,
   //page1
   &tbackbtn,
   &tcalbtn,
@@ -259,51 +358,131 @@ NexTouch *nex_listen_list[]=
   &pmodebtn,
   &pstatbtn,
   //page3
+  &sbackbtn,
+  &blynkbtn,
+  &chngwifi,
+  //&tdchng,
+  //page4
   &tcancel,
   &tconfirm,
-  //page4
+  //page5
   &pcancel,
   &pconfirm,
-  //page5
+  //page6
   &exitpop,
+  //page8
+  &wconfirm,
+  &wcancel,
   NULL
 };
+
+void saveSettings() {
+
+  prefs.begin("system", false);   // namespace "system", RW mode
+
+  prefs.putFloat("tankH", TANKHEIGHT);
+  prefs.putInt("startP", startperc);
+  prefs.putInt("stopP", stopperc); 
+  prefs.putBool("calib", tnkcalibrated);
+
+  prefs.end();
+
+  Serial.println("Settings saved to flash");
+}
+void loadSettings() {
+
+  prefs.begin("system", true);   // read-only mode
+
+  TANKHEIGHT     = prefs.getFloat("tankH", 0.0);
+  startperc      = prefs.getInt("startP", 0);
+  stopperc       = prefs.getInt("stopP", 0);
+  tnkcalibrated  = prefs.getBool("calib", false);
+
+
+  prefs.end();
+
+  Serial.println("Settings loaded from flash");
+  Serial.printf("The tank height is:  %.2f",TANKHEIGHT);
+  Serial.printf("the start and stop times are:%d and %d",startperc,stopperc);
+}
+void connectblynk(){ 
+}
+bool checkwifi(){
+  Serial.print("Attemptig to Connect to ");
+  Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  unsigned long start = millis();
+  wl_status_t status;
+  while ((status = WiFi.status()) != WL_CONNECTED) {
+    if (status == WL_NO_SSID_AVAIL) {
+        //Serial.println("SSID not found");
+        popupWithFmt(1,"%s not found",ssid);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return false;
+    } else if (status == WL_CONNECT_FAILED) {
+        //Serial.println("Connection failed, wrong password?");
+        popupWithFmt(1,"Connection failed, wrong password?");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
+    if (millis() - start > 20000) {
+        //Serial.println("WiFi connection timeout, check credentials or signal");
+        popupWithFmt(1,"WiFi connection timeout, check credentials or signal");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
+    delay(100);
+    Serial.println(".");
+  }
+  //Serial.println("\nWiFi exists and connected");
+  if(!timedateset){
+    loadClock();
+    return true;
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.println("disconnecting form wifi");
+  return true;
+}
 
 //SETUP FUNCTION
 void setup(){
   nexInit();
   Serial.begin(9600);
-  sendCommand("dims=75");
-  page0.show();
+  showpopuppg(0);
   //SPI.begin(SCK,MISO,MOSI); 
   LoRa.setPins(SS,RST,DIO0);
   if (!LoRa.begin(525E6)){ 
     Serial.println("Lora init failed. check connections"); 
     while(true){ 
-      Serial.println("no"); 
-      delay(100); // } 
+      Serial.println("LoRa init failed - retry hardware/ wiring"); 
+      delay(100);
       } 
-    Serial.println("LoRa init succeeded.");
   }
+  Serial.println("LoRa init succeeded.");
   LoRa.setSpreadingFactor(9);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.enableCrc();
   LoRa.onReceive(onReceive);
   LoRa.receive();
+  loraactive = true;
   //syncTimeFromWiFi();
-
+  if(!timedateset){
+    loadClock();
+  }
   Attachpush();
-  //printLocalTime();
+  updatehomepg();
   Serial.print("setup done");
   delay(100);
 }
 //LOOP FUNCTION
 void loop(){
   nexLoop(nex_listen_list); 
-  // if (currpg == 0){ 
-  //   updatetime(); 
-  // }
   if (rxTail != rxHead){//(rxTail != rxHead) {
     RxPacket &pkt = rxQueue[rxTail];
     //loraPacketReady = false;
@@ -314,13 +493,16 @@ void loop(){
   unsigned long now = millis();
   if(tankConnected && !tx.active && !waitingTankUpdate && tnkcalibrated){
     if(now-lastheartbeat >= HEARTBEAT_INTERVAL){
-      starttransaction(nullptr,0,destinationtnk,MSG_REQ_TANKLVL); 
+      starttransaction(nullptr,0,destinationtnk,MSG_REQ_TANKLVL);
       lastheartbeat = now;
     }
   }
   //LoRa.receive();
   processtx(); 
   Autopumpcheck();
+  if(timedateset){
+    updateClock();
+  } 
 }
 
 //LORA DATA RETRIVAL AND PROCESSING
@@ -369,74 +551,131 @@ void processLoRaPacket(const uint8_t* data, int len) {
 }
 void handleDataPacket(byte type, const uint8_t *payload,uint8_t len, byte sender, byte txID){ 
 
-  if (type != MSG_ACK) {
+  if(!isConnectedToSender(sender)){
+    //Serial.println("system not connected");
+    if(type==MSG_ACK && txID == tx.txID && tx.active && tx.type ==SYS_AVAILABLE && sender==tx.dest){
+      //Serial.println("Attempting connection");
+      uint8_t ERTPE=Geterror(payload, len);
+      en_connection(sender,ERTPE);
+      resetTx();
+    }
+    return;
+  }
+  bool processed = false;
+
+  if (type != MSG_ACK ) {
     if (isDuplicate(sender, txID)){//if (txID == lastRxSeq) {
       Serial.println("Duplicate packet detected — re-ACK only");
       sendACK(sender,txID);
       return;
     }
+    switch(type){ 
+      case DATA_TANK_LEVEL: 
+        if(sender !=destinationtnk || len < 2 ||!waitingTankUpdate) return; 
+        //sendACK(destinationtnk, txID); 
+        processed = GetTanklevel(payload, len);
+        waitingTankUpdate = !processed;
+        break; 
+      case DATA_PUMP_STATUS: 
+        Serial.println("pump packet recived");
+        if(sender !=destinationpmp || len < 2 ) return;  
+        //sendACK(destinationpmp, txID);
+        processed = GetPumpmstatus(payload, len);
+        waitingPumpUpdate = !processed; 
+        break; 
+      default: 
+        Serial.println("Unknown packet type"); 
+        break; 
+    }
   }
+
   if(type==MSG_ACK){
-      if (!tx.active) return; 
-      if (sender != tx.dest) return; 
-      if (txID != tx.txID) return;
-      ACKpopupmsg(0,tx.type,POP_LOW);
-      switch(tx.type){
-        case SYS_AVAILABLE:
-          en_connection(sender);
-          break;
-        case CAL_SETTINGS:
-          tnkcalibrated = true;
-          break;
-        case MSG_REQ_TANKLVL:
-          waitingTankUpdate = true;
+    uint8_t ERTPE=Geterror(payload, len);
+    if(sender==destinationtnk && waitingTankUpdate && tankConnected){
+      waitingTankUpdate = false;
+      popupWithFmt(2,"Tank update Error: %s",getTankErrorString(ERTPE));
+      return;
+    }else if(sender==destinationpmp && waitingPumpUpdate && pumpConnected){
+      waitingPumpUpdate = false;
+      popupWithFmt(2,"Pump updtae Error: %s",getPumpErrorString(ERTPE));
+      return;
+    }
+    if (!tx.active) return; 
+    if (sender != tx.dest) return; 
+    if (txID != tx.txID) return;
+    if(len<1)return;
+    switch(tx.type){
+      case CAL_SETTINGS:
+        if(ERTPE==0){
+           tnkcalibrated = true;
+           TANKHEIGHT=backup_TANKHEIGHT;
+           popupWithFmt(0,"Tank calibration successful");
+        }
+        else{
+          rollbackCalibration();
+          popupWithFmt(2,"Calibration failed: %s",getTankErrorString(ERTPE));
+        }
+        break;
+      case MSG_REQ_TANKLVL:
+        if(ERTPE==0){
           getupdate = millis();
+          waitingTankUpdate = true;
+        }
+        else if(ERTPE!=0){
+          popupWithFmt(2,"Tank update request failed: %s",getTankErrorString(ERTPE));
           break;
-        case MSG_REQ_PUMPSTAT:
+        }
+        break;
+      case MSG_REQ_PUMPSTAT:
+        if(ERTPE==0) {
           waitingPumpUpdate = true;
           getupdate = millis();
-          break;
-        default: 
-          //Serial.println("Unknown ACK packet type"); 
-          break;
-      }
-      Serial.println("ACK confirmed"); 
-      resetTx(); 
-      return; 
+        }
+        else if(ERTPE!=0){
+          popupWithFmt(1,"Pump update request failed: %s", getPumpErrorString(ERTPE));
+        }
+        break;
+      default: 
+        // other tx types — fall back to generic handling
+        if (ERTPE == 0) {
+          popupWithFmt(0,"ACK OK for type %u", tx.type);
+        } else {
+          popupWithFmt(2,"%s", getPumpErrorString(ERTPE));
+        }
+        break;
+    }
+    //ACKpopupmsg(0,tx.type,POP_LOW);
+    Serial.println("ACK confirmed"); 
+    resetTx(); 
+    return; 
   }
-  if(!isConnectedToSender(sender)) return;
-  switch(type){ 
-    case DATA_TANK_LEVEL: 
-      if(sender !=destinationtnk || len < 2 ||!waitingTankUpdate ) return; 
-      sendACK(destinationtnk, txID); 
-      GetTanklevel(payload, len);
-      waitingTankUpdate = false;
-      //delay(10);
-      break; 
-    case DATA_PUMP_STATUS: 
-      Serial.println("pump packet recived");
-      if(sender !=destinationpmp || len < 2 ) return;  
-      sendACK(destinationpmp, txID);
-      GetPumpmstatus(payload, len);
-      waitingPumpUpdate = false; 
-      //delay(10);
-      break; 
-    default: 
-      Serial.println("Unknown packet type"); 
-      break; 
+  if(processed){
+      savetxID(sender,txID);   //  ONLY update if processed
+      sendACK(sender,txID);      //  ACK AFTER success
+      resetTx();
   } 
 }
+void savetxID(byte sender,byte txID){
+  if(sender == destinationtnk){
+    lastRxSeqTank = txID;
+    return;
+  }
+  if(sender == destinationpmp){
+    lastRxSeqPump = txID;
+    return;
+  }
+}
 bool isDuplicate(byte sender, byte txID) {
-  uint8_t *lastSeq = nullptr;
+  //uint8_t *lastSeq = nullptr;
 
   if(sender == destinationtnk){
     if(txID == lastRxSeqTank) return true;
-    lastRxSeqTank = txID;
+    //lastRxSeqTank = txID;
     return false;
   }
   if(sender == destinationpmp){
     if(txID == lastRxSeqPump) return true;
-    lastRxSeqPump = txID;
+    //lastRxSeqPump = txID;
     return false;
   }
   return false; // other nodes
@@ -445,10 +684,6 @@ bool isDuplicate(byte sender, byte txID) {
 //RESETTERS 
 void resetTx() { 
   tx = pendingTX{}; 
-  // tnkset = CalibrationSettings{};
-  // pmpstat=PumpStatusPayload {};
-  // tnkcal=CalibrationPayload {};
-  //waitingforAck = false; 
 }
 void processtx(){
   unsigned long now = millis();
@@ -457,17 +692,24 @@ void processtx(){
     if(waitingTankUpdate){
       tankConnected = false;
       waitingTankUpdate = false;
-      g_tankConnection = DISCON_EST;
-      popupmsgCustom(1,"No Update recieved form tank",POP_HIGH);
+      g_tankConnection = CON_PART;
+      popupWithFmt(1,"No Update recieved form tank,checking connection");
+      resetTx();
+      starttransaction(nullptr,0,destinationtnk,SYS_AVAILABLE);
+      return;
     }
     if(waitingPumpUpdate){
       pumpConnected = false;
       waitingPumpUpdate = false;
-      g_pumpConnection = DISCON_EST;
+      g_pumpConnection = CON_PART;
       //g_pumpMode = prev_g_pumpMode;
       g_pumpState = prev_g_pumpState;
-      popupmsgCustom(1,"No Update recieved form pump",POP_HIGH);
+      popupWithFmt(1,"Pump not responding,checking connection");
+      resetTx();
+      starttransaction(nullptr,0,destinationpmp,SYS_AVAILABLE);
+      return;
     }
+
   }
   if (!tx.active) return;  
   if (now - tx.lastsendtime < ACK_TIMEOUT) return; 
@@ -475,22 +717,15 @@ void processtx(){
     Serial.println("Transaction failed"); 
     if(tx.dest == destinationtnk){ 
       tankConnected = false;
-      g_tankConnection = DISCON_EST;
-      popupmsgCustom(1,"Tank not responding try again",POP_HIGH);
-      //waitingTankUpdate = false;
+      waitingTankUpdate = false;
     }
     if (tx.dest == destinationpmp){ 
       pumpConnected = false; 
-      g_pumpConnection = DISCON_EST; 
+      waitingPumpUpdate = false; 
       //g_pumpMode = prev_g_pumpMode;
       g_pumpState = prev_g_pumpState;
-      popupmsgCustom(1,"Pump not responding try again",POP_HIGH);
-      // pmodebtn.setValue(prev_g_pumpMode);
-      // pmodebtn.setText(prev_g_pumpMode ? "AUTO" : "MANUAL");
     } 
-    byte failedType = tx.type; 
-    resetTx();
-    ACKpopupmsg(2,failedType,POP_HIGH);
+    ACKpopupmsg(2,tx.type);
     return; 
   } 
   Serial.println("Retrying transaction.."); 
@@ -498,103 +733,27 @@ void processtx(){
   sendRAW(tx); 
 }
 
-
-//DTAE AND TIME HANDLERS
-void showTime_date(struct tm &timeinfo){
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-  char timebuf[10];
-  char datebuf[20];
-
-  strftime(timebuf, sizeof(timebuf), "%I:%M%p", &timeinfo);
-  strftime(datebuf, sizeof(datebuf), "%Y/%m/%d", &timeinfo);
-
-  Time.setText(timebuf);
-  Date.setText(datebuf);
+//Calibration data ahndlers
+void backupCalibration() {
+  backup_TANKHEIGHT = TANKHEIGHT;
+  //backup_tnkset = tnkset;
+  backup_full_pressed = full_pressed;
+  backup_empty_pressed = empty_pressed;
+  backup_tnkcalibrated = tnkcalibrated;
+  // mark that a calibration is pending so we can rollback on failure
+  //calPending = true;
 }
-void updatetime(){
-  unsigned long now = millis();
+void rollbackCalibration() {
+  // restore backups
+  //TANKHEIGHT = backup_TANKHEIGHT;
+  //tnkset = backup_tnkset;
+  full_pressed = backup_full_pressed;
+  empty_pressed = backup_empty_pressed;
+  tnkcalibrated = backup_tnkcalibrated;
+  //calPending = false;
 
-  if(now-lastTimeupdate >= timeinterval){
-    lastTimeupdate = now;
-    printLocalTime();
-  }
-}
-void printLocalTime(){
-  struct tm timeinfo;
-  static int retries = 0;
-  static bool wifiTempConnected = false;
-  if (timeState == TIME_NORMAL) {
-    if(!getLocalTime(&timeinfo) && retries <10){
-      Serial.println("Failed to obtain time");
-      retries++;
-      //syncTimeFromWiFi();
-    // return;
-      if(retries>=10){
-        Serial.print("FAILURE TO GET TIME OVERALL");
-        retries=0;
-          if(WiFi.getMode()==WIFI_MODE_NULL || WiFi.status() !=WL_CONNECTED){
-            WiFi.mode(WIFI_STA);
-            WiFi.begin(ssid, password);
-            //wifiTempConnected = true;
-            timeState = TIME_RECONNECTING; 
-            Serial.println("reconnecting to wifi.");
-          }
-      }
-      return;
-    }
-    retries=0;
-    showTime_date(timeinfo);
-    return;
-  }
-
-  if(timeState == TIME_RECONNECTING){
-    if(WiFi.status() !=WL_CONNECTED){
-      return;
-    }
-    wifiTempConnected = true;
-    Serial.println("WiFi connected, syncing time");
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    if (getLocalTime(&timeinfo)) {
-      Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-      showTime_date(timeinfo);
-
-
-      if(wifiTempConnected){
-        Serial.println("Disconnecting WiFi after time sync");
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        Serial.println("WiFi disconnected.");
-        wifiTempConnected = false;
-      }
-      timeState = TIME_NORMAL;
-    }
-  }
-}
-void syncTimeFromWiFi(){
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected.");
-  
-  // Init and get the time
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
-    Serial.println("Failed to obtain time");
-  }
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-  showTime_date(timeinfo);
-
-  //disconnect WiFi as it's no longer needed
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  Serial.println("WiFi disconnected.");
+  // update UI and notify user
+  //updatecalipg();
 }
 
 //NEXTION BUTTON INTERATION
@@ -603,26 +762,37 @@ void pagebtn(void *ptr){
     case 0:
       if(ptr == &tankbtn) Serial.println("tank button pressed"),showupdatepage(1);
       else if(ptr == &pumpbtn) Serial.println("pump button pressed"),showupdatepage(2);
+      else if(ptr==&settingbtn) Serial.println("setting button pressed"),showupdatepage(3);
       break;
     case 1:
-      if(ptr == &tcalbtn) Serial.println("tank cal button pressed"),showupdatepage(3);
+      if(ptr == &tcalbtn) Serial.println("tank cal button pressed"),showupdatepage(4);
       else if(ptr == &tbackbtn) Serial.println("tank back button pressed"),showupdatepage(0);
       else if(ptr==&taddbtn) connect_systemsbtn(&taddbtn);
       break;
     case 2:
       if(ptr ==&pbackbtn) Serial.println("pump back button pressed"),showupdatepage(0);
-      else if(ptr==&pstrtstp) Serial.println("pump set buttons pressed"),showupdatepage(4);
+      else if(ptr==&pstrtstp) Serial.println("pump set buttons pressed"),showupdatepage(5);
       else if(ptr==&emergstop || ptr==&pmodebtn || ptr==&pstatbtn) pumpcontrolbtn(ptr);
       else if(ptr==&paddbtn)connect_systemsbtn(&paddbtn);
       break;
     case 3:
+      if(ptr ==&sbackbtn) Serial.println("setting back button pressed"),showupdatepage(0);
+      else if(ptr==&blynkbtn)Serial.println("blynk button pressed"),showupdatepage(45);
+      else if(ptr==&chngwifi) Serial.println("wifichng button pressed"),showupdatepage(8);
+      //else if(ptr==&tdchng)Serial.println("timedate button pressed"),showupdatepage(45);
+      break;
+    case 4:
       if(ptr ==&tcancel) Serial.println("tankcal cancel button pressed"),showupdatepage(1);
       else if(ptr == &tconfirm) Serial.println("tankcal confirm button pressed"),savedatabtn(&tconfirm);
       //else if(ptr == &tfullbtn || ptr == &temptybtn), savedatabtn(ptr);
       break;
-    case 4:
+    case 5:
       if(ptr ==&pcancel) Serial.println("pumpset cancel button pressed"),showupdatepage(2);
       else if(ptr == &pconfirm) Serial.println("pumpset confirm button pressed"),savedatabtn(&pconfirm);
+      break;
+    case 8:
+      if(ptr ==&wconfirm) Serial.println("setting cancel button pressed"),savedatabtn(&wconfirm);
+      else if(ptr == &wcancel) Serial.println("seting confirm button pressed"),showupdatepage(3);
       break;
     default:
       Serial.print("invalid page");
@@ -635,6 +805,7 @@ void showupdatepage(uint8_t page){
     case 0:
       //printLocalTime();
       page0.show();
+      updatehomepg();
       break;
     case 1:
       page1.show();
@@ -646,11 +817,20 @@ void showupdatepage(uint8_t page){
       break;
     case 3:
       page3.show();
+      updatesettingpg();
       break;
     case 4:
       page4.show();
+      updatecalipg();
+      break;
+    case 5:
+      page5.show();
+      break;
+    case 8:
+      page8.show();
       break;
     default:
+      currpg=0;
       Serial.println("current page not one of the big 3");
       page0.show();
       break;
@@ -658,44 +838,58 @@ void showupdatepage(uint8_t page){
   delay(50);
 }
 void savedatabtn(void *ptr){
-  uint32_t Number1,Number2,Number3;
 
   if(ptr==&tconfirm){
+    uint32_t Number1,Number2,Number3;
     if(!tankConnected){
-    popupmsgCustom(0,"Tank Disconnected,plz connect to send data",POP_NORMAL);
+    popupWithFmt(1,"Tank Disconnected,plz connect to send data");
     return;
     }
     if(tx.active){
-      Serial.println("mssg already in progress");
+      popupWithFmt(2,"Transaction in progress plz wait a few seconds and try again");
       return;
     }
 
     float newHeightMeters = 0;
     bool gotNewHeight = getIntFromText(theight, newHeightMeters);
-    // FIRST EVER CALIBRATION → must have height
-    if (TANKHEIGHT < 0.1f && !gotNewHeight) {
-      //Serial.println("First calibration requires tank height");
-      popupmsgCustom(2,"Tank height unknown/invalid",POP_HIGH);
-      return;
+    // ---- FIRST CALIBRATION CHECK ----
+    // If stored height is invalid AND user didn't enter a valid one
+    if (TANKHEIGHT <= 0.0) {
+      if (!gotNewHeight || newHeightMeters <= 0.0) {
+        popupWithFmt(2,"Tank height required for first calibration");
+        return;
+      }
+      // valid first height → store temporarily
+      backup_TANKHEIGHT = newHeightMeters;
+    }else {
+      // Tank height already exists
+      if (gotNewHeight) {
+        if (newHeightMeters <= 0.0) {
+          popupWithFmt(2,"Invalid tank height");
+          return;
+        }
+        // user is changing tank size
+        backup_TANKHEIGHT = newHeightMeters;
+      }
+      else {
+        // user not changing tank → use existing
+        backup_TANKHEIGHT = newHeightMeters;
+      }
     }
     float valCm =newHeightMeters*100;
     if(valCm > 450){
-    popupmsgCustom(2,"Tank height too large",POP_NORMAL);
-    return;
-    }
-
-    if(valCm <= 3){
-      popupmsgCustom(2,"Tank height too small",POP_NORMAL);
+      popupWithFmt(1,"Tank height too large");
       return;
     }
 
-    if (gotNewHeight) {
-      TANKHEIGHT = newHeightMeters;
+    if(valCm <= 3){
+      popupWithFmt(1,"Tank height too small");
+      return;
     }
     // Serial.print("The size of the tank is: ");
     // Serial.println(TANKHEIGHT*100);
 
-    tnkset.tankHeightCm = (uint16_t)(TANKHEIGHT * 100);
+    tnkset.tankHeightCm = (uint16_t)(valCm);
     // Serial.print("The size of the tank in cm is: ");
     // Serial.println(tnkset.tankHeightCm);
     tapprox.getValue(&Number1);
@@ -704,8 +898,10 @@ void savedatabtn(void *ptr){
     if(Number3!=-1 && Number1==0){
       if(Number3==0){
         tnkset.mode=CAL_MARK_EMPTY;
+        empty_pressed = true;
       }else if(Number3==1){
         tnkset.mode=CAL_MARK_FULL;
+        full_pressed = true;
       }else {
         Serial.println("Invalid text calibration input");
         return;
@@ -714,33 +910,62 @@ void savedatabtn(void *ptr){
       tnkset.mode=CAL_ESTIMATED;
       tnkset.value=(uint8_t)Number1;
       //starttransaction(&tnkset,sizeof(CalibrationSettings),destinationtnk,CAL_SETTINGS);
-    }else{
-     return;
+    }else if((Number3==-1 && Number1==0)){
+      Serial.println("indicate level");
+      return;
     }
     sendCalibratioNSettings();
     showupdatepage(1);
+    return;
   }else if(ptr==&pconfirm){
     uint32_t startH, stopM;
     hrnum.getValue(&startH);
     minnum.getValue(&stopM);
     if(startH==stopM){
-      popupmsgCustom(1,"start and stop % can not be the same",POP_NORMAL);
+      popupWithFmt(1,"start and stop % can not be the same");
       //Serial.println("Pump start and stop cannot be equal");
       return;
     }else if(startH!=stopM){
       startperc = startH;
       stopperc = stopM;
+      if(startperc > stopperc){
+        emptying_fulling = true;
+      }else if(startperc < stopperc){
+        emptying_fulling = false;
+      }
     }
-    Serial.printf("Pump auto range saved: START=%d STOP=%d\n",startperc, stopperc);
+    //Serial.printf("Pump auto range saved: START=%d STOP=%d\n",startperc, stopperc);
     showupdatepage(2);
+    return;
+  }else if(ptr==&wconfirm){
+    bool validID = checktext(wifiID,ssid,sizeof(ssid),RULE_SSID);
+    bool validpass = checktext(wifipass,password,sizeof(password),RULE_PASSWORD);
+    if(!validID||!validpass){
+      Serial.println("invalid credentails enetered");
+      popupWithFmt(1,"%s invalid credentails enetered",validID? "wifiname":"password");
+      return;
+    }
+    if(!checkwifi()){
+      Serial.println("WiFi didnt connect");
+      return;
+    }else{
+      showupdatepage(3);
+      popupWithFmt(0,"%s was found",ssid);
+      return;
+    }
   }else{
     return;
   } 
 }
 void connect_systemsbtn(void *ptr){
+  if (tx.active){ 
+    popupWithFmt(2,"Transaction in progress plz wait a few seconds and try again"); 
+    return; 
+  } 
   if (ptr==&taddbtn){
     dbSerial.println("add tank button pressed");
     g_tankConnection = CON_PART;
+    tankConnected = false;
     starttransaction(nullptr,0,destinationtnk,SYS_AVAILABLE);
     tlinktxt.setText(connectiontext[g_tankConnection]);
 
@@ -763,6 +988,7 @@ void Attachpush(){
   //page0
   tankbtn.attachPop(pagebtn,&tankbtn);
   pumpbtn.attachPop(pagebtn,&pumpbtn);
+  settingbtn.attachPop(pagebtn,&settingbtn);
   //page1
   tbackbtn.attachPop(pagebtn,&tbackbtn);
   tcalbtn.attachPop(pagebtn,&tcalbtn);
@@ -775,126 +1001,180 @@ void Attachpush(){
   pmodebtn.attachPop(pagebtn,&pmodebtn);
   pstatbtn.attachPop(pagebtn,&pstatbtn);
   //page3
+  sbackbtn.attachPop(pagebtn,&sbackbtn);
+  blynkbtn.attachPop(pagebtn,&blynkbtn);
+  chngwifi.attachPop(pagebtn,&chngwifi);
+  //tdchng.attachPop(pagebtn,&tdchng);
+  //page4
   tcancel.attachPop(pagebtn,&tcancel);
   tconfirm.attachPop(pagebtn,&tconfirm);
-  //page4 
+  //page5 
   pcancel.attachPop(pagebtn,&pcancel);
   pconfirm.attachPop(pagebtn,&pconfirm);
-  //page5
-  exitpop.attachPush(exitpopuppg,&exitpop);
+  //page6
+  exitpop.attachPop(exitpopuppg,&exitpop);
+  //page8
+  wconfirm.attachPop(pagebtn,&wconfirm);
+  wcancel.attachPop(pagebtn,&wcancel);
 }
 
+
 //Popupmessage handlers
-void showpopuppg(){
-  if(currpg!=5){
+// Show next popup if queue has something and no popup currently active
+void showNextPopupIfAny(){
+  if (popup.count == 0) {
+    popup.active = false;
+    return;
+  }
+  PopupMessage &msg = popup.queue[popup.head];
+  strncpy(g_popupContent, msg.content, sizeof(g_popupContent)-1);
+  //setPopupHeadFromValue(msg.severity);
+  popup.currentIndex++;
+  popup.active = true;
+  // show page and update display
+  showpopuppg(msg.severity);
+}
+// Enqueue an already-formatted message (head and message must be NUL terminated)
+void popup_enqueue(uint32_t severity, const char* message) {
+
+  if (popup.count == POPUP_QUEUE_SIZE) {
+    // queue full → overwrite oldest message (advance head, reuse insertIdx)
+    Serial.println("Popup queue full — overwriting oldest popup");
+    // queue full → remove oldest
+    popup.head = (popup.head + 1) % POPUP_QUEUE_SIZE;
+    popup.count--;
+  }
+  // copy into queue slot
+  PopupMessage &slot = popup.queue[popup.tail];
+  slot.severity = severity;
+  if (message) {
+    strncpy(slot.content, message,  POPUP_TEXT_LEN - 1);
+    slot.content[POPUP_TEXT_LEN - 1] = '\0';
+  } else {
+    slot.content[0] = '\0';
+  }
+  popup.tail = (popup.tail + 1) % POPUP_QUEUE_SIZE;
+  popup.count++;
+  if(currpg==6){
+    char Counter[15];
+    sprintf(Counter, "Msg 1 of %d",popup.count);
+    msgcounter.setText(Counter);
+  }
+  // if nothing is currently shown, immediately pop & show the new one
+  if (!popup.active) {
+    showNextPopupIfAny();
+  }
+}
+void showpopuppg(uint32_t value){
+  if (g_popupContent[0] == '\0') return;
+  if(currpg!=6){
   prevcurrpg = currpg;
   }
-  page5.show();
-  currpg =5;
+  page6.show();
+  setPopupHeadFromValue(value);
+  currpg =6;
   updatePopupPage();
 }
 void exitpopuppg(void *ptr){
   if(ptr == &exitpop){
-  Serial.println("exitpopup pressed");
-  g_popupActive = false;
-  g_popupCurrentPriority = POP_LOW;
-  showupdatepage(prevcurrpg);
-  }else return;
-}
+    Serial.println("exitpopup pressed");
+    if (popup.count == 0){
+      return;
+    }
+    popup.head = (popup.head + 1) % POPUP_QUEUE_SIZE;
+    popup.count--;
+    // If there are more messages queued, show the next one
+    if (popup.count > 0) {
+      showNextPopupIfAny();
+    } else {
+      popup.active = false;
+      g_popupContent[0] = '\0';
+      showupdatepage(prevcurrpg);
+    }
+  }
+} 
 void setPopupHeadFromValue(uint32_t value){
   switch(value){
     case 0:
       strncpy(g_popupHead, "Information", sizeof(g_popupHead)-1);
+      sendCommand("head.bco=2024");
       break;
 
     case 1:
       strncpy(g_popupHead, "Warning", sizeof(g_popupHead)-1);
+      sendCommand("head.bco=65504");
       break;
 
     case 2:
     default:
       strncpy(g_popupHead, "Error", sizeof(g_popupHead)-1);
+      sendCommand("head.bco=63488");
       break;
   }
 }
-void popupmsgCustom(uint32_t severity, const char* message,PopupPriority prio){
-
-  // If popup already active and new one is lower → ignore
-  if (g_popupActive && prio < g_popupCurrentPriority) {
-    return;
-  }
-
-  // Set popup head using same system
-  setPopupHeadFromValue(severity);
-
-  // Copy custom message safely
-  strncpy(g_popupContent, message, sizeof(g_popupContent) - 1);
-  g_popupContent[sizeof(g_popupContent) - 1] = '\0';
-
-  g_popupPendingUpdate = true;
-  g_popupActive = true;
-  g_popupCurrentPriority = prio;
-
-  showpopuppg();
-}
-void ACKpopupmsg(uint32_t value, byte type,PopupPriority prio){
-
-  // If popup already active and new one is lower → ignore
-  if (g_popupActive && prio < g_popupCurrentPriority) {
-    return;
-  }
-
-  // Set HEAD based on severity
-  setPopupHeadFromValue(value);
-
-  // Set CONTENT based on packet type + severity
+void ACKpopupmsg(uint32_t value, byte type){
+  // Compose the message locally into a buffer (same logic you had)
+  char contentBuf[POPUP_TEXT_LEN];
+  contentBuf[0] = '\0';
   switch(type){
+    case SYS_AVAILABLE:
+      if(tx.dest == destinationtnk){
+        g_tankConnection = DISCON_EST;
+        tankConnected = false;
+        strncpy(contentBuf,"Tank Connection failed,if issue persists check systems", sizeof(contentBuf)-1);
+      }else if(tx.dest == destinationpmp){
+        g_pumpConnection = DISCON_EST;
+        pumpConnected = false;
+        strncpy(contentBuf,"Pump Connection failed, if issue persists check systems", sizeof(contentBuf)-1);
+      }
+      break;
     case CAL_SETTINGS:
-      if(value == 0){
-        strncpy(g_popupContent, "Tank received calibration data", sizeof(g_popupContent)-1);
-      }
-      else if(value == 1){
-        strncpy(g_popupContent, "Tank calibration delayed", sizeof(g_popupContent)-1);
-      }
-      else{ // POP_ERROR
-        strncpy(g_popupContent, "Tank did not receive calibration data", sizeof(g_popupContent)-1);
-      }
-      g_popupPendingUpdate = true;
-      showpopuppg();
+      rollbackCalibration();
+      g_tankConnection = CON_PART;
+      resetTx();
+      starttransaction(nullptr,0,destinationtnk,SYS_AVAILABLE);
+      strncpy(contentBuf,"Calibration failed: Tank didnt get calibration data", sizeof(contentBuf)-1);
       break;
     case MSG_REQ_TANKLVL:
-      if(value == 0) break;
-      else if(value == 1) break;
-      else if(value == 2){
-        strncpy(g_popupContent, "Tank not responding,plz check system", sizeof(g_popupContent)-1);
-      }
-      g_popupPendingUpdate = true;
-      showpopuppg();
+      g_tankConnection = CON_PART;
+      resetTx();
+      starttransaction(nullptr,0,destinationtnk,SYS_AVAILABLE);
+      strncpy(contentBuf, "Tank not responding,checking connection", sizeof(contentBuf)-1);
       break;
     case MSG_REQ_PUMPSTAT:
-      if(value == 0) break;
-      else if(value == 1) break;
-      else if(value == 2){
-        strncpy(g_popupContent, "Pump not responding,plz check system", sizeof(g_popupContent)-1);
-      }
-      g_popupPendingUpdate = true;
-      showpopuppg();
+      g_pumpConnection = CON_PART;
+      resetTx();
+      starttransaction(nullptr,0,destinationpmp,SYS_AVAILABLE);
+      strncpy(contentBuf, "Pump not responding,checking connections", sizeof(contentBuf)-1);
       break;
     default:
-      Serial.println("unknow popupmsg");
-      //strncpy(g_popupContent, "Unknown system message", sizeof(g_popupContent)-1);
+      strncpy(contentBuf, "Unknown popup type", sizeof(contentBuf)-1);
       break;
   }
+  contentBuf[sizeof(contentBuf)-1] = '\0';
+
+  popup_enqueue(value, contentBuf);
+}
+void popupWithFmt(uint32_t severity, const char *fmt, ...){
+  // format into a buffer then enqueue
+  char buf[POPUP_TEXT_LEN];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf) - 1, fmt, args);
+  buf[sizeof(buf) - 1] = '\0';
+  va_end(args);
+
+  //const char* headstr = setPopupHeadFromValue(severity);
+  popup_enqueue(severity, buf);
 }
 
 //Display pages updaters
 void updatePopupPage(){
-  if(!g_popupPendingUpdate) return;
-
   pophead.setText(g_popupHead);
   popcontent.setText(g_popupContent);
-
-  g_popupPendingUpdate = false;
+  char Counter[15];
+  sprintf(Counter, "Msg 1 of %d",popup.count);
+  msgcounter.setText(Counter);
 }
 void updatetankpg(){
   tlvl.setValue(g_tankPercent);
@@ -913,10 +1193,12 @@ void disable_enablepmpstatbtn(uint8_t mode){
     sendCommand("tsw pstat,0");
     sendCommand("pstat.bco=50712");
     sendCommand("pstat.bco2=50712");
+    return;
   }else{
     sendCommand("tsw pstat,1");
     sendCommand("pstat.bco=63488");
     sendCommand("pstat.bco2=1024");
+    return;
   }
 }
 void updatepumppg(){
@@ -933,7 +1215,50 @@ void updatepumppg(){
   setTextfromint(pstarttxt, startperc);
   setTextfromint(pstptxt,stopperc);
 }
-
+void updatecalipg(){
+  if (TANKHEIGHT <= 0.00f) {
+    theight.setText("");   // leave blank
+    return;
+  }
+  setTextfromfloat(theight,TANKHEIGHT);
+  // if(tnkcalibrated){
+  //   sendCommand("tsw tnkheight,0");
+  //   sendCommand("tnkheight.bco=61277");
+  //   if(full_pressed && empty pressed){
+  //     sendCommand("tsw full,0");
+  //     sendCommand("full.bco=1024");
+  //     sendCommand("tsw empty,0");
+  //     sendCommand("empty.bco=1024");
+  //     return;
+  //   }
+  //   if(full_pressed){
+  //     sendCommand("tsw full,0");
+  //     sendCommand("full.bco=1024");
+  //   }
+  //   if(empty_pressed){
+  //     sendCommand("tsw empty,0");
+  //     sendCommand("empty.bco=1024");
+  //   }
+  //   return
+  // }else{
+  //   return;
+  // }
+}
+void updatesettingpg(){
+  wifiname.setText(ssid);
+  blynkbtn.setValue(g_blynkstste);
+  blynkbtn.setText(g_blynkstste? "ON":"OFF");
+}
+void updatehomepg(){
+  cloudicon.setPic(blynkactive? 5:6);
+  radioicon.setPic(loraactive? 3:4);
+  wifiicon.setPic(wifiactive? 7:8);
+  if(timedateset){
+    showTime_date(currentTime);
+  }else{
+    showNoTime();
+  }
+}
 //DATA conversions
 void setTextMeters(NexText &txt, float meters){
   char buf[16];
@@ -945,6 +1270,11 @@ void setTextMeters(NexText &txt, float meters){
 void setTextfromint(NexText &txt, int value){
   char buf[10];
   snprintf(buf, sizeof(buf), "%d", value);
+  txt.setText(buf);
+}
+void setTextfromfloat(NexText &txt, float value){
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.2f", value);
   txt.setText(buf);
 }
 bool getIntFromText(NexText &txt, float &outValue) {
@@ -982,6 +1312,85 @@ bool getIntFromText(NexText &txt, float &outValue) {
   //theight.setText("");
   return true;
 }
+bool checktext(NexText &txt,char* target,size_t maxLen,TextRule rule){
+  char buf[65] = {0};     
+  uint32_t buflen = sizeof(buf) - 1;
+
+  txt.getText(buf, buflen);
+  buf[buflen] = '\0';
+
+  Serial.print(" entered: "); Serial.println(buf);
+   // Trim leading spaces
+  char *start = buf;
+  while (*start == ' ') start++;
+   // Trim trailing spaces
+  char *end = start + strlen(start) - 1;
+  while(end > start && *end == ' ') *end-- = '\0';
+
+  size_t len = strlen(start);
+
+  // -------- RULES --------
+  size_t minLen = 0;
+  size_t maxAllowed = maxLen - 1;
+
+  switch(rule)
+  {
+    case RULE_SSID:
+      minLen = 1;
+      maxAllowed = 32;
+      break;
+
+    case RULE_PASSWORD:
+      minLen = 0;      // allow open networks
+      maxAllowed = 63;
+      break;
+  }
+
+  if (len < minLen || len > maxAllowed) {
+    Serial.println("ERROR: length invalid");
+    return false;
+  }
+
+
+
+  // Validate characters
+  for (int i = 0; start[i] != '\0'; i++) {
+    char c = start[i];
+
+    switch(rule){
+      case RULE_SSID:
+        if (!(isalnum(c) || c=='_' || c=='-' || c==' ' || c=='\'' || c=='.'))
+          return false;
+        break;
+
+      case RULE_PASSWORD:
+        if(strlen(start) < 8 && strlen(start) != 0){
+          return false;
+        }
+        else if(!isprint(c))  // allow any printable char
+          return false;
+        break;
+    }
+  }
+  // Copy valid SSID
+  strncpy(target,start,maxLen-1);
+  target[maxLen-1] = '\0';
+  Serial.println(target);
+
+  return true;
+}
+const char* getTankErrorString(uint8_t code) {
+    if (code < sizeof(TankErrorStrings)/sizeof(TankErrorStrings[0])) {
+        return TankErrorStrings[code];
+    }
+    return "Invalid error code";
+}
+const char* getPumpErrorString(uint8_t code) {
+    if (code < sizeof(PumpErrorStrings)/sizeof(PumpErrorStrings[0])) {
+        return PumpErrorStrings[code];
+    }
+    return "Invalid error code";
+}
 
 //Status check handlers
 void Autopumpcheck(){
@@ -989,41 +1398,61 @@ void Autopumpcheck(){
 
   if(g_pumpMode!=1) return;
 
-  if(startperc==stopperc) return;
-
   unsigned long now = millis();
-  if(!pump_triggered && g_tankPercent >= startperc){
-    Serial.println("AUTO: Starting pump");
-    pmpstat.state =1;
-    prev_g_pumpState = g_pumpState;
-    g_pumpState = 1;
-    pump_triggered = true;
-    if(currpg==2){
-      pstatbtn.setValue(g_pumpState);
-      pstatbtn.setText(g_pumpState ? "ON" : "OFF");
+  if(emptying_fulling){
+    if(!pump_triggered && g_tankPercent >= startperc){
+      Serial.println("AUTO: Starting pump");
+      pmpstat.state =1;
+      prev_g_pumpState = g_pumpState;
+      g_pumpState = 1;
+      pump_triggered = true;
+      if(currpg==2){
+        pstatbtn.setValue(g_pumpState);
+        pstatbtn.setText("ON");
+      }
+      sendPumpstatus();
+    }else if(pump_triggered && g_tankPercent <= stopperc){
+      Serial.println("AUTO: Stopping pump");
+      pmpstat.state =0;
+      prev_g_pumpState = g_pumpState;
+      g_pumpState = 0;
+      pump_triggered = false;
+      if(currpg==2){
+        pstatbtn.setValue(g_pumpState);
+        pstatbtn.setText("OFF");
+      }
     }
-    sendPumpstatus();
-  }else if(pump_triggered && g_tankPercent <= stopperc){
-    Serial.println("AUTO: Stopping pump");
-    pmpstat.state =0;
-    prev_g_pumpState = g_pumpState;
-    g_pumpState = 0;
-    pump_triggered = false;
-    if(currpg==2){
-      pstatbtn.setValue(g_pumpState);
-      pstatbtn.setText(g_pumpState ? "ON" : "OFF");
+  }else if(!emptying_fulling){
+    if(!pump_triggered && g_tankPercent <= startperc){
+      Serial.println("AUTO: Starting pump");
+      pmpstat.state =1;
+      prev_g_pumpState = g_pumpState;
+      g_pumpState = 1;
+      pump_triggered = true;
+      if(currpg==2){
+        pstatbtn.setValue(g_pumpState);
+        pstatbtn.setText("ON");
+      }
+      sendPumpstatus();
+    }else if(pump_triggered && g_tankPercent >= stopperc){
+      Serial.println("AUTO: Stopping pump");
+      pmpstat.state =0;
+      prev_g_pumpState = g_pumpState;
+      g_pumpState = 0;
+      pump_triggered = false;
+      if(currpg==2){
+        pstatbtn.setValue(g_pumpState);
+        pstatbtn.setText("OFF");
+      }
     }
-    sendPumpstatus();
   }
+  sendPumpstatus();
 }
 void pumpcontrolbtn(void *ptr){
   uint32_t btnval1;
   uint32_t btnval2;
-  if(Pmp_manual_override){
-    popupmsgCustom(0,"Pump has benn manually overriden,reset in orderr to send data",POP_NORMAL);
-    return;
-  }else if(!pumpConnected){
-    popupmsgCustom(0,"Pump Disconnected,plz connect to send data",POP_NORMAL);
+  if(Pmp_manual_override && pumpConnected){
+    popupWithFmt(1,"Pump has benn manually overriden,reset in order to send data");
     return;
   }
   if(ptr==&emergstop){
@@ -1044,30 +1473,42 @@ void pumpcontrolbtn(void *ptr){
     disable_enablepmpstatbtn(g_pumpMode);
     pmodebtn.setText(g_pumpMode ? "AUTO" : "MANUAL");
   }else if(ptr==&pstatbtn){
-    if(tx.active){
-      return;
-    }
-    pstatbtn.getValue(&btnval2);
     prev_g_pumpState = g_pumpState;
+    pstatbtn.getValue(&btnval2);
     g_pumpState = btnval2;
     pmpstat.state=g_pumpState;
     //pstatbtn.setValue(g_pumpState);
     pstatbtn.setText(g_pumpState ? "ON" : "OFF");
+    if(!pumpConnected){
+      popupWithFmt(1,"Pump Disconnected,plz connect to send data");
+      g_pumpState = prev_g_pumpState;
+      return;
+    }
     sendPumpstatus();
   }
 }
-void en_connection(byte fromwhere){
+void en_connection(byte fromwhere,uint8_t code){
   if(fromwhere==destinationtnk){
     tankConnected = true;
     g_tankConnection = CON_FULL;
-    popupmsgCustom(0,"Tank connection successful",POP_NORMAL);
-    Serial.println("tank Connection made");  
-  }
-  else if(fromwhere==destinationpmp){ 
+
+    if(code==5){
+      tnkcalibrated = false;
+      popupWithFmt(0,"Tank connection successful:Tank uncalibrated");
+    }else{
+      tnkcalibrated = true;
+      popupWithFmt(0,"Tank connection successful:Tank calibrated and ready");
+    } 
+  }else if(fromwhere==destinationpmp){ 
     pumpConnected = true; 
     g_pumpConnection = CON_FULL; 
-    popupmsgCustom(0,"Pump connection successful",POP_NORMAL); 
-    Serial.println("Pump Connection made");
+    if(code==2){
+      Pmp_manual_override = true;
+      popupWithFmt(0,"Pump connection successful.Pump manual override active");
+    }else{
+      Pmp_manual_override = false;
+      popupWithFmt(0,"Pump connection successful.Pump ready");
+    } 
   } else return;
 }
 
@@ -1076,24 +1517,24 @@ void unpackTankLevel(const uint8_t* buf, TankLevelPayload& p){
     p.percent = buf[0];
     p.cal_stage = buf[1];
 }
-void GetTanklevel(const uint8_t *payload, uint8_t len){
-  if (len < 2) return;
+bool GetTanklevel(const uint8_t *payload, uint8_t len){
+  if (len < 2) return false;
   unpackTankLevel(payload, tnklvl);
-  handleTankLevel(tnklvl);
+  return handleTankLevel(tnklvl);
 }
-void handleTankLevel(const TankLevelPayload& p){
+bool handleTankLevel(const TankLevelPayload& p){
   g_tankPercent = p.percent;
-  uint8_t cal = p.cal_stage;
-  calibration = (Con_calStates)cal;
-  Serial.print("The calibration stage is: ");
-  Serial.println(calibration);
-  Serial.print("the tank level is: ");
-  Serial.println(g_tankPercent);
+  calibration = (Con_calStates)p.cal_stage;
+  // Serial.print("The calibration stage is: ");
+  // Serial.println(calibration);
+  // Serial.print("the tank level is: ");
+  // Serial.println(g_tankPercent);
   if (currpg==1){
   tlvl.setValue(g_tankPercent);
   tperctxt.setValue(g_tankPercent);
   tcaltxt.setText(calibrationtext[calibration]);
   }
+  return true;
 }
 uint8_t packCalibrationSettings(uint8_t* buf, const CalibrationSettings& c){
     buf[0] = c.mode;
@@ -1109,6 +1550,9 @@ void sendCalibratioNSettings(){
 
   uint8_t len = packCalibrationSettings(payload, tnkset);
 
+  // Backup current state in case the tank rejects or times out
+  //backupCalibration();
+
   starttransaction(payload, len, destinationtnk, CAL_SETTINGS);
 }
 
@@ -1121,19 +1565,18 @@ void unpackPumpStatus(const uint8_t* buf, PumpStatusPayload& p){
     p.state = buf[0];
     p.mode = buf[1];
 }
-void GetPumpmstatus(const uint8_t *payload, uint8_t len){
-  if (len < 2) return;
+bool GetPumpmstatus(const uint8_t *payload, uint8_t len){
+  if (len < 2) return false;
   unpackPumpStatus(payload, pmpstat);
-  handlePumpStatus(pmpstat.state,pmpstat.mode);
+  return handlePumpStatus(pmpstat.state,pmpstat.mode);
 }
 void sendPumpstatus(){
   uint8_t payload[1];
 
- uint8_t len = packPumpStatus(payload,pmpstat);
-
- starttransaction(payload, len, destinationpmp, MSG_REQ_PUMPSTAT);
+  uint8_t len = packPumpStatus(payload,pmpstat);
+  starttransaction(payload, len, destinationpmp, MSG_REQ_PUMPSTAT);
 }
-void handlePumpStatus(uint8_t state,uint8_t mode){
+bool handlePumpStatus(uint8_t state,uint8_t mode){
   state = (state != 0) ? 1 : 0;
   mode = (mode!=0) ? 1 : 0;
 
@@ -1145,41 +1588,68 @@ void handlePumpStatus(uint8_t state,uint8_t mode){
       pump_triggered = false;
       g_pumpState = 0;
       g_pumpMode = 0;
-      popupmsgCustom(0,"Pump manual override actived",POP_HIGH);
-      return;
-    }else{
-      popupmsgCustom(0,"Pump manual override deactived",POP_HIGH);
-      return;
-    }
+      //popupWithFmt(0,"Pump manual override actived",POP_HIGH);
+      //return true;
+    }//else{
+    //   //popupWithFmt(0,"Pump manual override deactived",POP_HIGH);
+    //   return true;
+    // }
+    popupWithFmt(0,"Pump manual override %s",(Pmp_manual_override ? "activated" : "deactivated"));
+    return true;
   }else{
     g_pumpState = state;
     pump_triggered = (g_pumpState ==1);
   }
 
   if(state !=g_pumpState && waitingPumpUpdate){
-    popupmsgCustom(1,"Pump did status dint change, plz check pump",POP_HIGH);
+    popupWithFmt(1,"Pump status didnt change, plz check pump");
+    return true;
   }else if(!waitingPumpUpdate){
-    popupmsgCustom(0,"Pump has been turned ON/OFF maunally",POP_HIGH);
+    // if(g_pumpState==1){
+    //   popupWithFmt(0,"Pump has been turned ON maunally",POP_HIGH);
+    // }else if(g_pumpState==0){
+    //   popupWithFmt(0,"Pump has been turned OFF maunally",POP_HIGH);
+    // }
+    popupWithFmt(0,"Pump has been turned %s manually",(g_pumpState ? "ON" : "OFF"));
+    return true;
+  }else{
+    return false;
   }
+  return false;
+}
+
+//Erro packet handlers
+void unpackError(const uint8_t* buf, ErrorPayload& p){
+  p.ERR = buf[0];
+}
+uint8_t Geterror(const uint8_t *payload, uint8_t len){
+  if (len < 1) return 0xFF;
+  unpackError(payload, errotype);
+  ERROR = (Errortype)errotype.ERR;
+  return errotype.ERR;;
+  //return handleerror(errotype);
+}
+void handleerror(const ErrorPayload& p){
+  ERROR = (Errortype)p.ERR;
 }
 
 //LORA DATA TRANSMISSION
 bool starttransaction(const void *payload,uint8_t payloadLen, byte dest, byte type){ 
   if (tx.active){ 
-    Serial.println("Transaction already active"); 
+    popupWithFmt(2,"Data transaction in progress plz wait a few second and try again"); 
     return false; 
   }  
 
   if (type != SYS_AVAILABLE) { 
     if(!isConnectedToSender(dest)){
       if(!tankConnected){
-        popupmsgCustom(0,"Tank disconnected,plz connect to send data",POP_NORMAL);
+        popupWithFmt(1,"Tank disconnected,plz connect to send data");
       }else if(!pumpConnected){
-        popupmsgCustom(0,"Pump disconnected,plz connect to send data",POP_NORMAL);
+        popupWithFmt(1,"Pump disconnected,plz connect to send data");
       }
       return false;
     } 
-  } 
+  }
   resetTx();
   tx.active = true; 
   tx.dest = dest; 
@@ -1217,4 +1687,180 @@ void sendACK(byte where, byte txID){
   LoRa.write(0); 
   LoRa.endPacket(); 
   LoRa.receive(); 
+}
+
+// void setNextionButtonState(const char* name, bool enabled, uint32_t colorActive, uint32_t colorDisabled) {
+//   // assume button object names on page3 are "full" and "empty"
+//   char cmd[64];
+//   // enable/disable touch
+//   snprintf(cmd, sizeof(cmd), "tsw %s,%d", name, enabled ? 1 : 0);
+//   sendCommand(cmd);
+//   // set background color to show disabled
+//   snprintf(cmd, sizeof(cmd), "%s.bco=%lu", name, enabled ? colorActive : colorDisabled);
+//   sendCommand(cmd);
+// }
+// void updatecalipg(){
+//   // If fully calibrated, disable both
+//   if (tnkcalibrated) {
+//     setNextionButtonState("full", false, 50712, 63488);
+//     setNextionButtonState("empty", false, 50712, 63488);
+//     // also disable height editing if you want:
+//     sendCommand("tnkheight.en=0");
+//     return;
+//   }
+
+//   // If the user already pressed full, disable full; empty remains to be pressed
+//   setNextionButtonState("full", !full_pressed, 50712, 63488);
+//   setNextionButtonState("empty", !empty_pressed, 50712, 63488);
+
+//   // height editing: if either full or empty already pressed and you want to prevent edits
+//   // choose desired behaviour. Example: allow editing but warn user that edits imply re-calibration.
+//   sendCommand("tnkheight.en=1");
+// }
+
+//battery percentagehandlers
+// uint8_t BatteryVoltage(){
+//   int total = 0;
+//   for(int i=0; i<10; i++){
+//     total += analogRead(BATTERY_PIN);
+//   }
+//   int adcValue = total / 20;
+
+//   float vMeasured = (adcValue / 4095.0) * ADC_REF;
+//   float vBattery = vMeasured * ((R1 + R2) / R2);
+
+//   Serial.print("Battery Voltage: ");
+//   Serial.println(vBattery);
+
+//   float percent = (vBattery - 7.0) / (9.6 - 7.0) * 100.0;
+
+//   if (percent > 100) percent = 100;
+//   if (percent < 0) percent = 0;
+//   return percent;
+// }
+// void smoothVolatge(){
+//   float smoothedPercent = 0;
+//   float newPercent = BatteryVoltage();  // your existing function
+
+//   smoothedPercent = smoothedPercent + alpha * (newPercent - smoothedPercent);
+
+//   Serial.println(smoothedPercent);
+// }
+
+// //DTAE AND TIME HANDLERS
+void showTime_date(struct tm &timeinfo){
+  //Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+  char timebuf[10];
+  char datebuf[20];
+
+  strftime(timebuf, sizeof(timebuf), "%I:%M%p", &timeinfo);
+  strftime(datebuf, sizeof(datebuf), "%Y/%m/%d", &timeinfo);
+
+  Time.setText(timebuf);
+  Date.setText(datebuf);
+}
+void showNoTime(){
+  Time.setText("--:--");
+  Date.setText("----/--/--");
+}
+void loadClock() {
+  if (getLocalTime(&currentTime)) {
+    Serial.println("Time obtain sucessfully");
+    timedateset = true;
+    return;
+  }else{
+    Serial.println("RTC time not available, retrieving from WiFi...");
+    syncTimeFromWiFi();
+  }
+}
+void updateClock(){
+  if(millis() >= nextClockUpdate){
+    currentTime.tm_min++;            // increment manually
+    currentTime.tm_sec = 0;
+    mktime(&currentTime);
+    if(currpg==0){
+    showTime_date(currentTime);
+    }
+    alignMinuteUpdate();
+  }
+}
+bool syncTimeFromWiFi(){
+  // Check if SSID is blank/null
+  if (ssid[0] == '\0') {
+      Serial.println("No WiFi SSID set, skipping time sync.");
+      timedateset = false;
+      return false;
+  }
+
+  if(WiFi.getMode()==WIFI_MODE_NULL || WiFi.status() !=WL_CONNECTED){
+    WiFi.mode(WIFI_STA);
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+
+    unsigned long start = millis();
+
+    while(WiFi.status() != WL_CONNECTED){
+      if(millis() - start > 20000){
+        Serial.println("WiFi connection timeout");
+        timedateset = false;
+        return false;
+      }
+
+      delay(500);
+      Serial.print(".");
+    }
+  }
+
+  Serial.println("\nWiFi connected");
+  static int retries = 0;
+  while(retries<10){
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    if(getLocalTime(&currentTime)){
+      //alignMinuteUpdate();
+      Serial.println("Time synced from NTP");
+      timedateset = true;
+
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+
+      Serial.println("WiFi disconnected");
+      retries=0;
+      return true;
+    }else{
+      Serial.println("Failed to obtain NTP time, retrying...");
+      retries++;
+      delay(100); // small delay before retry
+    }
+  }
+  Serial.println("Failed to sync time after 10 retries");
+  timedateset = false;
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  retries = 0; // reset for next attempt
+  return false;
+}
+void alignMinuteUpdate(){
+  int secondsRemaining = 60 - currentTime.tm_sec;
+  nextClockUpdate = millis() + (secondsRemaining * 1000);
+}
+void setManualTime(int year,int month,int day,int hour,int minute,int second){
+
+  struct tm t;
+
+  t.tm_year = year - 1900;
+  t.tm_mon  = month - 1;
+  t.tm_mday = day;
+  t.tm_hour = hour;
+  t.tm_min  = minute;
+  t.tm_sec  = second;
+
+  time_t newTime = mktime(&t);
+  struct timeval now = { newTime, 0 };
+  settimeofday(&now, NULL);
+  currentTime = t;   // update smooth clock
+  Serial.println("Manual time set");
+  //showTime_date(currentTime);
+  timedateset = true;
+  alignMinuteUpdate();
 }

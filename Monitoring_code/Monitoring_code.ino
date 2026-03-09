@@ -27,11 +27,21 @@
 #define CAL_STAGE_ESTIMATED 1
 #define CAL_STAGE_PARTIAL   2
 #define CAL_STAGE_FULL      3
+//error types
+#define NONE 0
+#define UNKNOWN_ERROR 1
+#define FAULTY_SENSOR 2
+#define INVALID_TNKHEIGHT 3
+#define INVALID_OFFSET 4
 //LED pins
 #define CON_LED 27
 #define RED_LED 13
 #define BLUE_LED 14
 #define GREEN_LED 12
+//lora data packet container
+#define RX_QUEUE_SIZE 6
+#define MAX_PACKET_SIZE 21
+#define RX_NEXT(i) ((uint8_t)((i + 1) % RX_QUEUE_SIZE))
 
 //SYSTEM ADDRESSES
 byte localaddress = 0xBB;  // address of this device 
@@ -39,7 +49,7 @@ byte destinationtdsply = 0xFF; // destination to send to
 
 //TIMER VARIABLES
 const unsigned long CONNECTION_TIMEOUT = 120000; // 2 minutes
-const unsigned long ACK_TIMEOUT = 5000; 
+const unsigned long ACK_TIMEOUT = 3000; 
 unsigned long lastSend =0;
 const unsigned long SEND_INTERVAL = 10000;
 long lastSendTime = 0; // last send time
@@ -55,6 +65,8 @@ bool datarequested = false;
 //LORA DATA HOLDERS
 uint8_t lastRxSeq = 255;   // invalid initial value
 volatile int loraPacketSize = 0;
+volatile uint8_t rxHead = 0;
+volatile uint8_t rxTail = 0;
 uint8_t loraRxBuffer[21];   // safe size
 byte msgcount = 0;  // count of outgoing messages 
 
@@ -63,7 +75,8 @@ float sensorOffset = -1;  // cm, unknown initially
 float tankHeight =-1; //cm,unknown inittially
 int calEmptyDistance = -1;
 int calFullDistance  = -1;
-uint8_t calibrationStage = CAL_STAGE_ESTIMATED;
+uint8_t calibrationStage = CAL_STAGE_NONE;
+uint8_t ERRORTYPE = NONE;
 const float SENSOR_MIN_DISTANCE = 3.0;  // cm 
 const float SENSOR_MAX_DISTANCE = 450.0; // cm
 unsigned char data_buffer[4] = {0}; 
@@ -92,6 +105,7 @@ enum CalConfidence : uint8_t {
   CONF_MED  = 2,   // observed repeatedly
   CONF_HIGH = 3    // user-marked
 };
+
 struct CalPoint {
   float distance;             // cm
   CalConfidence confidence;
@@ -104,7 +118,7 @@ struct TankLevelPayload {
   uint8_t percent;
   uint8_t cal_stage; 
 }; 
-TankLevelPayload tnklvl;
+TankLevelPayload tnklvl{};
 
 
 struct CalibrationSettings { 
@@ -112,7 +126,18 @@ struct CalibrationSettings {
   uint8_t value;  // % if estimated, unused otherwise 
   uint16_t tankHeightCm;  // usable water height
 };
-CalibrationSettings tnkset;
+CalibrationSettings tnkset{};
+//LORA DATA PACKET structures
+struct RxPacket {
+  uint8_t data[MAX_PACKET_SIZE];
+  uint8_t len;
+};
+RxPacket rxQueue[RX_QUEUE_SIZE];
+//tank calibrtion level packet 
+// struct ErrorPayload { 
+//   uint8_t ERR; 
+// };
+// ErrorPayload errotype;
 
 
 enum SystemState {
@@ -122,6 +147,14 @@ enum SystemState {
 };
 SystemState systemState = STATE_UNCALIBRATED;
 
+// enum Errortype{
+//   NONE,
+//   UNKNOWN_ERROR,
+//   FAULTY_SENSOR,
+//   INVALID_TNKHEIGHT,
+//   INVALID_OFFSET
+// };
+// Errortype ERROR = NONE;
 
 void setup() { 
   //initialize Serial Monitor 
@@ -155,10 +188,12 @@ void setup() {
 }
 void loop() { 
   unsigned long now = millis();
-  if (loraPacketReady) {
-    loraPacketReady = false;
-    processLoRaPacket(loraRxBuffer, loraPacketSize);
-    LoRa.receive();   // return to RX mode
+   if (rxTail != rxHead){//(rxTail != rxHead) {
+    RxPacket &pkt = rxQueue[rxTail];
+    //loraPacketReady = false;
+    processLoRaPacket(pkt.data, pkt.len);
+    rxTail = RX_NEXT(rxTail);
+       // retu  rn to RX mode
   }
 
   if (connected && systemState == STATE_READY && datarequested && !tx.active) { 
@@ -214,8 +249,6 @@ bool isCalibrated() {
 
 void resetTx() { 
   tx = pendingTX{}; // C++ value-initialize (clears everything) 
-  //tnkset = CalibrationSettings{};
-  //tnkcal=CalibrationPayload {};
 }
 
 
@@ -325,10 +358,12 @@ uint8_t packTankLevel(uint8_t* buf, const TankLevelPayload& p){
     return 2;
 }
 void SendTanklevel(){
+  //tnklvl.percent = percent;
+  tnklvl.cal_stage = calibrationStage;
+
   uint8_t payload[2];
 
   uint8_t len = packTankLevel(payload, tnklvl);
-
   starttransaction(payload, len, DATA_TANK_LEVEL);
 }
 void sendTankLevel() { 
@@ -339,6 +374,8 @@ void sendTankLevel() {
 
   if (!readSensorWithRetry(d)) {
     Serial.println("Tank level read failed");
+    ERRORTYPE = FAULTY_SENSOR;
+    sendACK(0,ERRORTYPE);
     return;
   }
   // if (isSensorStuck(d)) {
@@ -349,7 +386,8 @@ void sendTankLevel() {
   //observeCalibration(d);
   uint8_t percent = computePercent(d);
   tnklvl.percent = percent;
-  tnklvl.cal_stage = calibrationStage;
+  ERRORTYPE =NONE;
+  // tnklvl.cal_stage = calibrationStage;
   SendTanklevel();
   //starttransaction(&tnklvl,sizeof(TankLevelPayload),DATA_TANK_LEVEL);
   //Serial.print("Sent tank level: "); 
@@ -372,15 +410,21 @@ void unpackCalibrationSettings(const uint8_t* buf, CalibrationSettings& c){
     c.tankHeightCm = buf[2] | (buf[3] << 8);
 }
 bool getCalibratioNSettings(const uint8_t *payload, uint8_t len){
-  if (len < 4) return false;
+  if (len < 4){
+    ERRORTYPE =UNKNOWN_ERROR;
+    return false;
+  }
   unpackCalibrationSettings(payload,tnkset);
   return processCalibration(tnkset);
 }
 bool processCalibration(CalibrationSettings& c) {
   float d;
+  uint8_t offset;
 
   if (!readSensorWithRetry(d)) {
     Serial.println("Calibration failed: sensor unstable");
+    ERRORTYPE = FAULTY_SENSOR;
+    //sendError();
     //systemState = STATE_UNCALIBRATED;
     return false;
   }
@@ -388,9 +432,18 @@ bool processCalibration(CalibrationSettings& c) {
   uint8_t MODE = c.mode;
   uint8_t VALUE = c.value;
 
+   Serial.print("The tnk size is: ");
+   Serial.println(TNKH);
+
   if(tankHeight ==-1 || tankHeight !=TNKH){
     if (!geometryInitialized || TNKH > 0) {
       geometryInitialized = initFromGeometry(TNKH);
+      if(!geometryInitialized){
+        Serial.println("tank height invalid");
+        ERRORTYPE = INVALID_TNKHEIGHT;
+        //sendError();
+        return false;
+      }
     }
   }
   switch (MODE) {
@@ -406,19 +459,33 @@ bool processCalibration(CalibrationSettings& c) {
       applyEstimatedPercent(d,VALUE);
       break;
   }
-  getCalibrationStage();
-  if (isCalibrated()) {
-    systemState = STATE_READY;
-    Serial.println("System calibrated and READY");
-    printCalibrationState();
-    return true;
-    //starttransaction(&tnkcal, sizeof(CalibrationPayload), DATA_CALIBRATION);
-  } else {
-    Serial.println("System uncalibrated and READY");
+  // Serial.print("the offset calculated is: ");
+  // Serial.println(sensorOffset);
+  if(sensorOffset > 3){
+    if (isCalibrated()) {
+      systemState = STATE_READY;
+      getCalibrationStage();
+      Serial.println("System calibrated and READY");
+      printCalibrationState();
+      ERRORTYPE =NONE;
+      return true;
+      //starttransaction(&tnkcal, sizeof(CalibrationPayload), DATA_CALIBRATION);
+    } else {
+      Serial.println("System uncalibrated");
+      systemState = STATE_UNCALIBRATED;
+      ERRORTYPE = UNKNOWN_ERROR;
+      //sendError();
+      printCalibrationState();
+      return false;
+    }
+  }else{
+    Serial.println("offset too small");
     systemState = STATE_UNCALIBRATED;
-    printCalibrationState();
+    ERRORTYPE = INVALID_OFFSET;
+    //sendError();
     return false;
   }
+  ERRORTYPE = UNKNOWN_ERROR;
   return false;
   //delay(20);
 }
@@ -483,7 +550,7 @@ bool starttransaction(const void *payload,uint8_t payloadLen, byte type){
   //Serial.println("Start transaction success"); 
   return true;
 }
-void sendRAW(pendingTX &t){ 
+void sendRAW(pendingTX &t){
   LoRa.beginPacket(); 
   LoRa.write(t.dest); 
   LoRa.write(localaddress); 
@@ -496,22 +563,23 @@ void sendRAW(pendingTX &t){
   t.lastsendtime = millis(); //+ backoff;
   //waitingforAck = true; 
   //Serial.println("data sent..");
-  delay(10);
+  //delay(10);
   LoRa.receive();
 }
-void sendACK(byte msgID){ 
+void sendACK(byte msgID,uint8_t status){ 
   LoRa.beginPacket(); 
   LoRa.write(destinationtdsply); 
   LoRa.write(localaddress); 
   LoRa.write(msgID); 
   LoRa.write(MSG_ACK); 
-  LoRa.write(0); // no payload 
-  //LoRa.write(subtype); 
+  LoRa.write(1); // no payload 
+  LoRa.write(status); 
   LoRa.endPacket(); 
   //delay(10); 
   Serial.println("ACK sent"); 
   LoRa.receive();
 }
+
 
 
 void clearSensorBuffer() {
@@ -538,18 +606,19 @@ bool readSensorWithRetry(float &outDistance) {
   return false;
 }
 bool updateCalPoint(CalPoint &p, float newDist, CalConfidence newConf){
-  if (newDist < SENSOR_MIN_DISTANCE || newDist > SENSOR_MAX_DISTANCE)
-    return false;
+  if (newDist < SENSOR_MIN_DISTANCE || newDist > SENSOR_MAX_DISTANCE) return false;
 
   // Authority rules
-  if (p.confidence > newConf)
+  if (p.confidence > newConf){
     return false;   // cannot downgrade authority
+  }
 
   p.distance = newDist;
   p.confidence = newConf;
 
-  if (newConf == CONF_HIGH)
+  if (newConf == CONF_HIGH){
     p.stableHits = 255;
+  }
 
   return true;
 }
@@ -557,9 +626,9 @@ bool updateCalPoint(CalPoint &p, float newDist, CalConfidence newConf){
 
 void markFull(float d){
   if (!geometryInitialized) return;
-  if (!updateCalPoint(calFull, d, CONF_HIGH))
+  if (!updateCalPoint(calFull, d, CONF_HIGH)){
     return;
-
+  }
   sensorOffset = d;
 
   if (geometryInitialized && calEmpty.confidence < CONF_HIGH){
@@ -569,13 +638,17 @@ void markFull(float d){
 }
 void markEmpty(float d){
   if (!geometryInitialized) return;
-  if (!updateCalPoint(calEmpty, d, CONF_HIGH))
+  if (!updateCalPoint(calEmpty, d, CONF_HIGH)){
+    Serial.print("update cla unsucess");
     return;
+  }
+  Serial.print("update cla sucess");
 
   if (geometryInitialized && calFull.confidence < CONF_HIGH){
     float derivedFull = d - tankHeight;
     updateCalPoint(calFull, derivedFull, CONF_LOW);
-
+    Serial.print("The offset calculted here is: ");
+    Serial.println(derivedFull);
     sensorOffset = derivedFull;
   }
 }
@@ -640,50 +713,54 @@ void printCalibrationState(){
 void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte txID){
 
   // Duplicate detection (except ACKs)
+  if(type==MSG_ACK){
+    if (!tx.active) return; 
+    if (sender != tx.dest) return; 
+    if (txID != tx.txID) return; 
+    Serial.println("ACK confirmed"); 
+    resetTx(); 
+    return; 
+  }
+  bool processed = false;
   if (type != MSG_ACK) {
-    if (txID == lastRxSeq) {
+    if (txID == lastRxSeq && type==CAL_SETTINGS) {
       Serial.println("Duplicate packet detected — re-ACK only");
-      sendACK(txID);
+      sendACK(txID,ERRORTYPE);
       return;
     }
-  }
 
-  bool processed = false;
 
-  switch(type){ 
-    //Serial.println("now matching types"); 
-    case MSG_ACK: 
-      if (!tx.active) return; 
-      if (sender != tx.dest) return; 
-      if (txID != tx.txID) return; 
-      Serial.println("ACK confirmed"); 
-      resetTx(); break; 
-    case SYS_AVAILABLE: 
-      connected = true;
-      digitalWrite(CON_LED,HIGH);
-      processed = true;  
-      break;
-    case CAL_SETTINGS:
-      if(!connected) return;
-      if (sender !=destinationtdsply || len <4) return;
-      systemState = STATE_CALIBRATING;
-      processed = getCalibratioNSettings(payload,len);
-      //delay(10);
-      break;
-    case MSG_REQ_TANKLVL:
-      if(!connected) return;
-      if (sender !=destinationtdsply) return;
-      datarequested = true;
-      processed = true;
-      break; 
-    default: 
-      Serial.println("Unknown packet type"); 
-      break; 
+    switch(type){ 
+      //Serial.println("now matching types"); 
+      case SYS_AVAILABLE: 
+        connected = true;
+        digitalWrite(CON_LED,HIGH);
+        ERRORTYPE = (systemState==STATE_READY)?0:5;
+        sendACK(txID,ERRORTYPE);  
+        break;
+      case CAL_SETTINGS:
+        if(!connected) return;
+        if (sender !=destinationtdsply || len <4) return;
+        systemState = STATE_CALIBRATING;
+        getCalibratioNSettings(payload,len);
+        processed = true;
+        //delay(10);
+        break;
+      case MSG_REQ_TANKLVL:
+        if(!connected) return;
+        if (sender !=destinationtdsply) return;
+        datarequested = true;
+        ERRORTYPE = NONE;
+        sendACK(txID,ERRORTYPE);
+        break; 
+      default: 
+        Serial.println("Unknown packet type"); 
+        break; 
+    }
   }
   if(processed){
       lastRxSeq = txID;   //  ONLY update if processed
-      sendACK(txID);      //  ACK AFTER success
-      delay(100);
+      sendACK(txID,ERRORTYPE);      //  ACK AFTER success
   }
   //lastRxSeq = txID;
 }
@@ -709,15 +786,27 @@ void processLoRaPacket(const uint8_t* data, int len) {
 }
 void onReceive(int packetSize) {
   if (packetSize == 0) return;
-  if (packetSize > sizeof(loraRxBuffer)) return;
+  if (packetSize > MAX_PACKET_SIZE) return;
 
-  loraPacketSize = packetSize;
-
-  for (int i = 0; i < packetSize && LoRa.available(); i++) {
-    loraRxBuffer[i] = LoRa.read();
+  //if (packetSize > sizeof(loraRxBuffer)) return;
+  uint8_t nextHead = RX_NEXT(rxHead);
+  if (nextHead == rxTail) {
+    Serial.println("RX queue full — packet dropped");
+    return;  // queue overflow protection
   }
 
-  loraPacketReady = true;   // signal loop()
+  //loraPacketSize = packetSize;
+  rxQueue[rxHead].len = packetSize;
+  for (int i = 0; i < packetSize; i++) {
+    rxQueue[rxHead].data[i] = LoRa.read();
+  }
+
+  // for (int i = 0; i < packetSize && LoRa.available(); i++) {
+  //   loraRxBuffer[i] = LoRa.read();
+  // }
+  rxHead = nextHead;
+  //loraPacketReady = true;   // signal loop()
 }
+
 
 

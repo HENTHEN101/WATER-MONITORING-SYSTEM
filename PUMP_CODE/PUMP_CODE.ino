@@ -19,6 +19,11 @@
 #define CAL_ESTIMATED    0x11
 #define MSG_REQ_TANKLVL  0x12
 #define MSG_REQ_PUMPSTAT 0x13
+//error types
+#define NONE 0
+#define UNKNOWN_ERROR 1
+#define MANUAL_OVERRIDE 2
+#define FAST_TOGGLE 3
 //pump switch and LEDs
 #define PUMP_SWITCH 13//13//33//25//27
 #define CON_LED 17//2//0//4
@@ -42,7 +47,7 @@ bool connected = false;
 bool datarequested = false;
 bool pump_triggered = false;
 
-
+uint8_t ERRORTYPE = NONE;
 //TIMER VALUES
 unsigned long lastRetryTime =0;
 unsigned long lastTimeupdate =0;
@@ -55,7 +60,7 @@ unsigned long pumpStartTime = 0;
 const unsigned long MIN_PUMP_SWITCH_INTERVAL = 3000; // 3 seconds
 volatile unsigned long lastEStopTime = 0;
 volatile unsigned long lastOnOffTime = 0;
-const unsigned long debounceDelay = 50;
+const unsigned long debounceDelay = 1000;
 
 
 //LORA DATA HOLDERS
@@ -63,8 +68,6 @@ uint8_t lastRxSeq = 255;   // invalid initial value
 volatile int loraPacketSize = 0;
 uint8_t loraRxBuffer[21];   // safe size
 byte msgcount = 0;  // count of outgoing messages 
-
-
 
 enum PumpState {
   NORMAL,
@@ -89,7 +92,7 @@ struct PumpStatusPayload {
   uint8_t state;
   uint8_t mode;
 };
-PumpStatusPayload pmpstat;
+PumpStatusPayload pmpstat{};
 
 void IRAM_ATTR handleStopButton(){
   unsigned long now = millis();
@@ -149,8 +152,8 @@ void loop() {
   checkPumpFailsafe();
 
   if (connected && datarequested && !tx.active) { 
-    pmpstat.state = digitalRead(PUMP_SWITCH);
-    pmpstat.mode = currentState;
+    // pmpstat.state = digitalRead(PUMP_SWITCH);
+    // pmpstat.mode = currentState;
     // Serial.print("the mode of the pump is: ");
     // Serial.println(pmpstat.mode);
     sendPumpstatus(); 
@@ -206,9 +209,9 @@ void processtx(){
 }
 
 void resetTx() { 
+  ERRORTYPE = NONE;
   tx = pendingTX{}; // C++ value-initialize (clears everything) 
-  //tnkset = CalibrationSettings{};
-  //tnkcal=CalibrationPayload {};
+  pmpstat=PumpStatusPayload{};
 }
 
 //pump packet handlers
@@ -222,29 +225,28 @@ void unpackPumpStatus(const uint8_t* buf, PumpStatusPayload& p){
 }
 bool GetPumpmstatus(const uint8_t *payload, uint8_t len){
   //PumpStatusPayload p;
-  if (len < 1) return false;
+  if (len < 1){
+    ERRORTYPE = UNKNOWN_ERROR;
+    return false;
+  }
   unpackPumpStatus(payload, pmpstat);
   return handlePumpStatus(pmpstat.state);
 }
 void sendPumpstatus(){
+  pmpstat.state = digitalRead(PUMP_SWITCH);
+  pmpstat.mode = currentState;
+
   uint8_t payload[2];
 
- uint8_t len = packPumpStatus(payload,pmpstat);
+  uint8_t len = packPumpStatus(payload,pmpstat);
 
   starttransaction(payload, len, DATA_PUMP_STATUS);
 }
 bool handlePumpStatus(uint8_t state){
   //int state = payload.toInt();
   state = (state != 0) ? 1 : 0;
-  unsigned long now = millis();
-
-  // Prevent rapid toggling
-  if(now - pumpStartTime < MIN_PUMP_SWITCH_INTERVAL){
-    Serial.println("Pump toggle blocked (too soon)");
-    return false;
-  }
   //lastPumpCommandTime = now;   // record last valid command
-
+  unsigned long now = millis();
   if(state != g_pumpState){
     // Serial.print("Pump state changed to: ");
     // Serial.println(state);
@@ -257,8 +259,14 @@ bool handlePumpStatus(uint8_t state){
     } else {
       Serial.println("Pump turned OFF");
     }
+    ERRORTYPE = NONE;
+    return true;
+  }else if(state == g_pumpState){
+    Serial.println("same state been sent check something out");
+    ERRORTYPE = NONE;
     return true;
   }
+  ERRORTYPE = UNKNOWN_ERROR;
   return false;
 }
 void checkPumpFailsafe(){
@@ -314,14 +322,14 @@ void sendRAW(pendingTX &t){
   delay(10);
   LoRa.receive();
 }
-void sendACK(byte msgID){ 
+void sendACK(byte msgID,uint8_t status){ 
   LoRa.beginPacket(); 
   LoRa.write(destinationtdsply); 
   LoRa.write(localaddress); 
   LoRa.write(msgID); 
   LoRa.write(MSG_ACK); 
-  LoRa.write(0); // no payload 
-  //LoRa.write(subtype); 
+  LoRa.write(1); // no payload 
+  LoRa.write(status); 
   LoRa.endPacket(); 
   //delay(10); 
   Serial.println("ACK sent"); 
@@ -329,15 +337,6 @@ void sendACK(byte msgID){
 }
 
 void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte txID){
-
-  // Duplicate detection (except ACKs)
-  if (type != MSG_ACK) {
-    if (txID == lastRxSeq) {
-      Serial.println("Duplicate packet detected — re-ACK only");
-      sendACK(txID);
-      return;
-    }
-  }
 
   if(type==MSG_ACK){
     if (!tx.active) return; 
@@ -349,29 +348,58 @@ void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte
   }
 
   bool processed = false;
-  if(currentState == FAULT)return;
-  switch(type){ 
-    //Serial.println("now matching types"); 
-    case SYS_AVAILABLE: 
-      connected = true;
-      Serial.println("tank sys mssg recieved");
-      digitalWrite(CON_LED,HIGH);
-      processed = true; 
-      break;
-    case MSG_REQ_PUMPSTAT:
-      if(!connected) return;
-      if (sender !=destinationtdsply|| len < 1) return;
-      processed = GetPumpmstatus(payload,len);
-      datarequested = processed;
-      break; 
-    default: 
-      Serial.println("Unknown packet type"); 
-      break; 
+  // Allow ONLY SYS_AVAILABLE when in FAULT
+  if (currentState == FAULT && type == SYS_AVAILABLE) {
+    connected = true;
+    ERRORTYPE = MANUAL_OVERRIDE;
+    digitalWrite(CON_LED,HIGH);
+    lastRxSeq = txID;   //  ONLY update if processed
+    sendACK(txID,ERRORTYPE);
+    Serial.println("pump connected to display but it in fault mode");
+    return; 
+  }else if(currentState == FAULT && type != SYS_AVAILABLE){
+    Serial.println("pump in fault mode ignore all");
+    return;
+  }
+
+  // Duplicate detection (except ACKs)
+  if (type != MSG_ACK) {
+    if (txID == lastRxSeq) {
+      Serial.println("Duplicate packet detected — re-ACK only");
+      sendACK(txID,ERRORTYPE);
+      return;
+    }
+  
+    switch(type){ 
+      //Serial.println("now matching types"); 
+      case SYS_AVAILABLE: 
+        connected = true;
+        Serial.println("tank sys mssg recieved");
+        digitalWrite(CON_LED,HIGH);
+        processed = true; 
+        break;
+      case MSG_REQ_PUMPSTAT:
+        if(!connected) return;
+        if (sender !=destinationtdsply|| len < 1) return;
+        // Prevent rapid toggling
+        if(millis() - pumpStartTime < MIN_PUMP_SWITCH_INTERVAL){
+          Serial.println("Pump toggle blocked (too soon)");
+          ERRORTYPE = FAST_TOGGLE;
+          processed = true;
+          break;
+        }
+        datarequested = GetPumpmstatus(payload,len);
+        processed = true;
+        break; 
+      default: 
+        Serial.println("Unknown packet type"); 
+        break;
+    }
   }
   if(processed){
       lastRxSeq = txID;   //  ONLY update if processed
-      sendACK(txID);      //  ACK AFTER success
-      delay(100);
+      sendACK(txID,ERRORTYPE);      //  ACK AFTER success
+      //delay(100);
   }
   //lastRxSeq = txID;
 }
