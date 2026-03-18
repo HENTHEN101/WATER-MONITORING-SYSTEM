@@ -712,7 +712,6 @@ void printCalibrationState(){
 
 void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte txID){
 
-  // Duplicate detection (except ACKs)
   if(type==MSG_ACK){
     if (!tx.active) return; 
     if (sender != tx.dest) return; 
@@ -722,6 +721,7 @@ void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte
     return; 
   }
   bool processed = false;
+  // Duplicate detection (except ACKs)
   if (type != MSG_ACK) {
     if (txID == lastRxSeq && type==CAL_SETTINGS) {
       Serial.println("Duplicate packet detected — re-ACK only");
@@ -733,6 +733,7 @@ void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte
     switch(type){ 
       //Serial.println("now matching types"); 
       case SYS_AVAILABLE: 
+        resetTx();
         connected = true;
         digitalWrite(CON_LED,HIGH);
         ERRORTYPE = (systemState==STATE_READY)?0:5;
@@ -807,6 +808,3 @@ void onReceive(int packetSize) {
   rxHead = nextHead;
   //loraPacketReady = true;   // signal loop()
 }
-
-
-
