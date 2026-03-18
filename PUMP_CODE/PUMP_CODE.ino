@@ -24,6 +24,8 @@
 #define UNKNOWN_ERROR 1
 #define MANUAL_OVERRIDE 2
 #define FAST_TOGGLE 3
+#define PUMP_ALREADY_ON 4
+#define PUMP_ALREADY_OFF 5
 //pump switch and LEDs
 #define PUMP_SWITCH 13//13//33//25//27
 #define CON_LED 17//2//0//4
@@ -33,7 +35,7 @@
 
 
 //PUMP FLAG HOLDERS
-uint8_t g_pumpState   = 0;
+uint8_t g_pumpState = 0;
 volatile bool estopPressed = false;
 volatile bool onoffPressed = false;
 
@@ -46,7 +48,7 @@ volatile bool loraPacketReady = false;
 bool connected = false;
 bool datarequested = false;
 bool pump_triggered = false;
-
+uint8_t LASTERRORTYPE =NONE;
 uint8_t ERRORTYPE = NONE;
 //TIMER VALUES
 unsigned long lastRetryTime =0;
@@ -159,7 +161,6 @@ void loop() {
     sendPumpstatus(); 
     datarequested = false;
   } 
-
   processtx(); 
 }
 
@@ -172,23 +173,23 @@ void change_mode(){
       currentState = FAULT;
       digitalWrite(MODE,HIGH);
       digitalWrite(PUMP_SWITCH, LOW);
-      datarequested = true;
       g_pumpState =0;
     }else{
       currentState = NORMAL;
       digitalWrite(MODE,LOW);
-      datarequested = true;
     }
+    datarequested = connected? true:false;
   }else if(onoffPressed){
     Serial.println("ON_OFF button pressed");
     onoffPressed = false;
     if(currentState != FAULT){
-      datarequested = true;
-      g_pumpState = !g_pumpState;
+      datarequested = connected? true:false;
+      uint8_t btn = g_pumpState;
+      btn = !btn;
+      //g_pumpState = !g_pumpState;
       // Serial.print("Pump physiocally was turned: ");
       // Serial.println(g_pumpState? "ON":"OFF");
-      digitalWrite(PUMP_SWITCH,g_pumpState);
-      handlePumpStatus(g_pumpState);
+      handlePumpStatus(btn);
     }
   }
 }
@@ -248,8 +249,8 @@ bool handlePumpStatus(uint8_t state){
   //lastPumpCommandTime = now;   // record last valid command
   unsigned long now = millis();
   if(state != g_pumpState){
-    // Serial.print("Pump state changed to: ");
-    // Serial.println(state);
+    //Serial.print("Pump state changed to: ");
+    //Serial.println(state);
     g_pumpState = state;
     pump_triggered = (state ==1);
     digitalWrite(PUMP_SWITCH,state);
@@ -282,7 +283,9 @@ void checkPumpFailsafe(){
 
 
 bool starttransaction(const void *payload,uint8_t payloadLen, byte type){ 
-  if(!connected) return false;
+  // if(!connected){
+  //   return false;
+  // }
   if (tx.active){ 
     //Serial.println("Transaction already active"); 
     return false; 
@@ -337,7 +340,6 @@ void sendACK(byte msgID,uint8_t status){
 }
 
 void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte txID){
-
   if(type==MSG_ACK){
     if (!tx.active) return; 
     if (sender != tx.dest) return; 
@@ -373,9 +375,15 @@ void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte
     switch(type){ 
       //Serial.println("now matching types"); 
       case SYS_AVAILABLE: 
+        resetTx();
         connected = true;
         Serial.println("tank sys mssg recieved");
         digitalWrite(CON_LED,HIGH);
+        if(g_pumpState==1){
+          ERRORTYPE=PUMP_ALREADY_ON;
+        }else{
+          ERRORTYPE=PUMP_ALREADY_OFF;
+        }
         processed = true; 
         break;
       case MSG_REQ_PUMPSTAT:
@@ -389,6 +397,7 @@ void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte
           break;
         }
         datarequested = GetPumpmstatus(payload,len);
+        ERRORTYPE=NONE;
         processed = true;
         break; 
       default: 
@@ -398,7 +407,7 @@ void handleDataPacket(byte type, uint8_t *payload,uint8_t len, byte sender, byte
   }
   if(processed){
       lastRxSeq = txID;   //  ONLY update if processed
-      sendACK(txID,ERRORTYPE);      //  ACK AFTER success
+      sendACK(txID,ERRORTYPE); 
       //delay(100);
   }
   //lastRxSeq = txID;
